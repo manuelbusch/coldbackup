@@ -1,0 +1,28 @@
+[package]
+name = "coldbackup"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+
+# encoding / integrity
+base64 = "0.22"
+sha2 = "0.10"
+crc32fast = "1.4"
+rand = "0.8"
+zstd = "0.13"
+hex = "0.4"
+
+# PDF write (vector)
+krilla = "0.6"
+
+# PDF read/render + QR decode
+hayro = "0.5"
+image = "0.25"
+rqrr = "0.8"
+system-fonts = "0.1"
+
+# QR encode (ECC control, no images)
+qrcodegen = "1"
