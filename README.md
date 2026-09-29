@@ -233,3 +233,7 @@ cargo test
 
 The tests render real PDFs and decode real QR codes; a release build
 (`cargo test --release`) is considerably faster.
+
+## License
+
+Licensed under the [MIT License](LICENSE).
