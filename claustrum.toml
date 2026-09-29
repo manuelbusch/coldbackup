@@ -1,0 +1,294 @@
+# Claustrum configuration for developing a Rust project.
+#
+# Copy to `claustrum.toml` next to the project's Cargo.toml and trust it with
+# `claustrum trust`. Only the keys that matter for Rust are set; see
+# ../claustrum.example.toml for everything else.
+#
+# The picture: Claude edits the sources inside the sandbox, where neither
+# cargo nor rustc exist (they cannot run under WASIX). Building and testing
+# happen on the host through the actions below, each running confined and
+# with a fixed argv. The dependency sources are mounted read-only so Claude
+# can read the code of the crates it uses.
+
+[sandbox]
+timeout_secs = 120
+
+# cargo executes code Claude can write: build.rs, proc macros, and
+# .cargo/config.toml (rustc-wrapper, runner). Insist on the OS sandbox so a
+# missing backend refuses to start instead of running cargo unconfined.
+confinement = "required"
+
+[network]
+# cargo fetches the sparse index and the .crate files from these two hosts.
+# `cargo add`, `cargo update` and the first `cargo build` after a dependency
+# change need them; a project with a complete Cargo.lock and a warm registry
+# cache works with mode = "disabled". Git dependencies need their forge as
+# well (e.g. "github.com").
+mode = "allowlist"
+allow = ["index.crates.io", "static.crates.io"]
+
+# Sources of downloaded dependencies, read-only, so Claude can look up how a
+# crate works instead of guessing. `~/.cargo/registry/src/<index>/<crate>-<version>/`.
+[[mounts]]
+guest = "/cargo/registry"
+host = "~/.cargo/registry/src"
+
+# The standard library sources, if `rustup component add rust-src` is
+# installed. Adjust the toolchain directory.
+# [[mounts]]
+# guest = "/rust-src"
+# host = "~/.rustup/toolchains/stable-aarch64-apple-darwin/lib/rustlib/src/rust/library"
+
+[claude]
+system_prompt = """
+cargo and rustc are not available in the sandbox. Build, test, lint and format
+through the host actions (`host` lists them): `host check`, `host test`,
+`host test-crate <crate> [filter]`, `host clippy`, `host fmt`. git is not
+available either; use `host status`, `host diff`, `host add <path>`,
+`host commit <message>`, `host switch <branch>`, `host merge <branch>` and
+the other git actions. Dependency sources are mounted read-only under
+/cargo/registry."""
+
+tools = ["Agent", "Workflow"]
+
+# Host actions. Everything runs confined: writes are limited to the workspace
+# (target/, Cargo.lock, formatted sources), the action's private $TMPDIR and
+# ~/.cargo/registry (index, downloaded .crate files, unpacked sources).
+# ~/.cargo/bin and ~/.cargo/config.toml stay read-only, so no action can
+# install a binary or a rustc wrapper that later runs on the host. The
+# network is reachable only through the proxy and the allowlist above.
+#
+# `~/.cargo/registry` is enough for registry dependencies; cargo falls back
+# to a read-only package-cache lock when $CARGO_HOME itself is not writable.
+# Add "~/.cargo/git" for git dependencies.
+[actions]
+command = "host"
+
+[[actions.action]]
+name = "check"
+description = "Type-check the whole workspace including tests and examples (fast, no codegen)"
+command = ["cargo", "check", "--workspace", "--all-targets"]
+timeout_secs = 600
+env = { CARGO_TERM_COLOR = "never" }
+writable = ["~/.cargo/registry"]
+
+[[actions.action]]
+name = "build"
+description = "Build the whole workspace with the given profile"
+command = ["cargo", "build", "--workspace", "--profile", "{profile}"]
+timeout_secs = 1200
+env = { CARGO_TERM_COLOR = "never" }
+writable = ["~/.cargo/registry"]
+
+[[actions.action.input]]
+name = "profile"
+choices = ["dev", "release"]
+default = "dev"
+
+[[actions.action]]
+name = "test"
+description = "Run the whole test suite"
+command = ["cargo", "test", "--workspace"]
+timeout_secs = 1200
+env = { CARGO_TERM_COLOR = "never", RUST_BACKTRACE = "1" }
+writable = ["~/.cargo/registry"]
+
+[[actions.action]]
+name = "test-crate"
+description = "Run the tests of one crate, optionally only those whose name contains the filter"
+command = ["cargo", "test", "-p", "{crate}", "--", "{filter}"]
+timeout_secs = 1200
+env = { CARGO_TERM_COLOR = "never", RUST_BACKTRACE = "1" }
+writable = ["~/.cargo/registry"]
+
+[[actions.action.input]]
+name = "crate"
+description = "Package name as in Cargo.toml"
+pattern = "[A-Za-z][A-Za-z0-9_-]{0,63}"
+
+[[actions.action.input]]
+name = "filter"
+description = "Substring of the test path, e.g. parser::tests"
+pattern = "[A-Za-z0-9_:]{0,80}"
+default = ""
+
+[[actions.action]]
+name = "clippy"
+description = "Lint the whole workspace with clippy; warnings are errors"
+command = ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"]
+timeout_secs = 600
+env = { CARGO_TERM_COLOR = "never" }
+writable = ["~/.cargo/registry"]
+
+[[actions.action]]
+name = "fmt"
+description = "Format all sources in place with rustfmt"
+command = ["cargo", "fmt", "--all"]
+
+[[actions.action]]
+name = "fmt-check"
+description = "Report sources that rustfmt would change, without touching them"
+command = ["cargo", "fmt", "--all", "--", "--check"]
+
+[[actions.action]]
+name = "doc"
+description = "Build the documentation of the workspace crates (target/doc)"
+command = ["cargo", "doc", "--workspace", "--no-deps"]
+timeout_secs = 600
+env = { CARGO_TERM_COLOR = "never" }
+writable = ["~/.cargo/registry"]
+
+# Dependency management. Cargo.toml and Cargo.lock live in the workspace, so
+# Claude could also edit them directly; these actions resolve versions and
+# update the lock file and the registry cache in one confined step.
+[[actions.action]]
+name = "add-dep"
+description = "Add a dependency from crates.io, e.g. `serde` or `serde@1.0` or `tokio@1 features=rt,macros`"
+command = ["cargo", "add", "{crate}", "--features", "{features}"]
+timeout_secs = 300
+env = { CARGO_TERM_COLOR = "never" }
+writable = ["~/.cargo/registry"]
+
+[[actions.action.input]]
+name = "crate"
+description = "Crate name with optional version requirement"
+pattern = "[A-Za-z][A-Za-z0-9_-]{0,63}(@[0-9A-Za-z.^~=<>*, -]{1,40})?"
+
+[[actions.action.input]]
+name = "features"
+description = "Comma-separated feature list"
+pattern = "[A-Za-z0-9_,-]{0,200}"
+default = ""
+
+[[actions.action]]
+name = "update"
+description = "Update Cargo.lock to the newest compatible versions"
+command = ["cargo", "update"]
+timeout_secs = 300
+env = { CARGO_TERM_COLOR = "never" }
+writable = ["~/.cargo/registry"]
+
+# git. The sandbox has no git binary, and .git lives in the workspace, which
+# Claude can write. These actions cover the local workflow: inspect, stage,
+# commit, branch, merge. Nothing talks to a remote (push, fetch, pull are
+# deliberately absent: they would ship whatever the workspace contains), so
+# the actions need no network and no `writable` entry.
+#
+# Every action starts with the same fixed `-c` overrides. Command-line
+# configuration wins over .git/config and ~/.gitconfig, so hooks and the
+# fsmonitor daemon that Claude could point at its own scripts never run, and
+# commits are not signed (the confined process cannot read ~/.gnupg or the
+# ssh keys anyway). Aliases cannot shadow built-in commands. Filter and diff
+# drivers defined in .git/config would still run, confined, like any other
+# git action; keep confinement on.
+#
+# Author name and email come from ~/.gitconfig, which the confined process
+# can read (HOME is inherited).
+[[actions.action]]
+name = "status"
+description = "Show the working tree status and the current branch"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "status", "--short", "--branch"]
+
+[[actions.action]]
+name = "diff"
+description = "Show unstaged changes, optionally limited to one path"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "diff", "--", "{path}"]
+
+[[actions.action.input]]
+name = "path"
+kind = "path"
+default = "."
+
+[[actions.action]]
+name = "diff-staged"
+description = "Show the changes staged for the next commit"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "diff", "--cached"]
+
+[[actions.action]]
+name = "log"
+description = "Show the most recent commits of the current branch, one per line"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "log", "--oneline", "--decorate", "-n", "{count}"]
+
+[[actions.action.input]]
+name = "count"
+kind = "integer"
+min = 1
+max = 200
+default = "20"
+
+[[actions.action]]
+name = "branches"
+description = "List local branches with their upstream and last commit"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "branch", "--list", "-vv"]
+
+[[actions.action]]
+name = "add"
+description = "Stage one file or directory (`.` for everything)"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "add", "--", "{path}"]
+
+[[actions.action.input]]
+name = "path"
+kind = "path"
+must_exist = true
+
+[[actions.action]]
+name = "unstage"
+description = "Remove one file or directory from the index again, keeping the working tree"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "restore", "--staged", "--", "{path}"]
+
+[[actions.action.input]]
+name = "path"
+kind = "path"
+
+[[actions.action]]
+name = "commit"
+description = "Commit the staged changes with a one-line message"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "commit", "--no-verify", "-m", "{message}"]
+
+[[actions.action.input]]
+name = "message"
+description = "Commit message, a single line"
+pattern = ".{1,1000}"
+max_len = 1000
+
+[[actions.action]]
+name = "commit-file"
+description = "Commit the staged changes with the message read from a file in the workspace (multi-line, e.g. target/commit-msg.txt)"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "commit", "--no-verify", "--cleanup=whitespace", "-F", "{file}"]
+
+[[actions.action.input]]
+name = "file"
+kind = "path"
+must_exist = true
+
+[[actions.action]]
+name = "switch"
+description = "Check out an existing local branch"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "switch", "{branch}"]
+
+[[actions.action.input]]
+name = "branch"
+pattern = "[A-Za-z0-9][A-Za-z0-9._/-]{0,100}"
+
+[[actions.action]]
+name = "switch-new"
+description = "Create a new branch from the current commit and check it out"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "switch", "--create", "{branch}"]
+
+[[actions.action.input]]
+name = "branch"
+pattern = "[A-Za-z0-9][A-Za-z0-9._/-]{0,100}"
+
+[[actions.action]]
+name = "merge"
+description = "Merge a local branch into the current one (fast-forward when possible, otherwise a merge commit with the default message)"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false", "merge", "--no-edit", "--no-verify", "{branch}"]
+
+[[actions.action.input]]
+name = "branch"
+pattern = "[A-Za-z0-9][A-Za-z0-9._/-]{0,100}"
+
+[[actions.action]]
+name = "merge-abort"
+description = "Abort a merge that stopped on conflicts and restore the pre-merge state"
+command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "merge", "--abort"]
